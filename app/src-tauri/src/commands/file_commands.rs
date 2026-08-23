@@ -92,18 +92,17 @@ pub async fn download_steam_cmd(
 ) -> Result<(), String> {
     // Read the URL first and release that lock before taking `file_io`, so this path locks in
     // the same order as every other command (file_io is never held while acquiring another).
-    let download_url = {
+    // The archive filename/format (zip on Windows, tar.gz on Linux) is decided inside
+    // `download_steam_cmd` itself, since that's where the platform branching already lives.
+    let base_download_url = {
         let tool_properties = state.tool_properties.lock().await;
-        format!(
-            "{}/steamcmd.zip",
-            tool_properties.properties().steam_cmd_download_url
-        )
+        tool_properties.properties().steam_cmd_download_url.clone()
     };
 
     {
         let file_io = state.file_io.lock().await;
         file_io
-            .download_steam_cmd(&download_url)
+            .download_steam_cmd(&base_download_url)
             .await
             .map_err(|e| e.to_string())?;
     }

@@ -19,6 +19,9 @@ pub enum ServerTarget {
     /// Linux server, launched inside WSL. `distro` selects a specific WSL distribution
     /// (`wsl -d <distro> -- ...`); `None` uses the default distro.
     Wsl { distro: Option<String> },
+    /// Native Linux server, launched directly — Longbow itself running on Linux. Unlike `Wsl`,
+    /// there's no host/guest split here, so no distro selection or path translation is needed.
+    Linux,
 }
 
 
@@ -97,7 +100,7 @@ pub fn windows_path_to_wsl(path: &Path) -> String {
 /// since Longbow is always the Windows-side process.
 pub fn path_for_target(target: &ServerTarget, path: &Path) -> String {
     match target {
-        ServerTarget::Windows => path.display().to_string(),
+        ServerTarget::Windows | ServerTarget::Linux => path.display().to_string(),
         ServerTarget::Wsl { .. } => windows_path_to_wsl(path),
     }
 }

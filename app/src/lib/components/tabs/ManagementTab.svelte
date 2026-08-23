@@ -32,6 +32,7 @@
     listWslDistros,
     getSavedGames,
     renameSave,
+    getHostPlatform,
     checkPrerequisites,
     installPrerequisite,
     type Prerequisite,
@@ -83,11 +84,28 @@
     }),
   );
 
+  // Which OS Longbow itself is running on, so the Server Target picker only offers options that
+  // make sense from this host (a native Windows .exe or a WSL guest are meaningless on Linux;
+  // a native Linux binary is meaningless on Windows). Defaults to "windows" until detected so
+  // the picker doesn't flash empty on first render.
+  let hostPlatform = $state("windows");
+
   // WSL detection is lazy (only probed the first time the WSL target is selected) rather than
   // on every mount, since it shells out to `wsl.exe` and most users will never touch it.
   let wslChecked = $state(false);
   let wslAvailable = $state(false);
   let wslDistros = $state<string[]>([]);
+
+  async function detectHostPlatform() {
+    try {
+      hostPlatform = await getHostPlatform();
+    } catch {
+      hostPlatform = "windows";
+    }
+    if (hostPlatform === "linux") {
+      serverTargetKind.set("linux");
+    }
+  }
 
   async function ensureWslChecked() {
     if (wslChecked) return;
@@ -185,9 +203,13 @@
   }
 
   onMount(() => {
-    loadAll();
-    refreshPrereqs();
-    refreshBackups();
+    // Detected first and awaited: refreshPrereqs() below reads $serverTargetKind, which
+    // detectHostPlatform() may just have changed away from its "windows" default.
+    detectHostPlatform().then(() => {
+      loadAll();
+      refreshPrereqs();
+      refreshBackups();
+    });
   });
 
   // --- Backup / restore -----------------------------------------------------------------------
@@ -392,7 +414,7 @@
     persistConfigFlags();
   }
 
-  function onServerTargetChange(kind: "windows" | "wsl") {
+  function onServerTargetChange(kind: "windows" | "wsl" | "linux") {
     serverTargetKind.set(kind);
     if (kind === "wsl") {
       ensureWslChecked();
@@ -463,6 +485,9 @@
   function currentServerTarget(): ServerTarget {
     if ($serverTargetKind === "wsl") {
       return { kind: "wsl", distro: $wslDistro && $wslDistro.trim().length > 0 ? $wslDistro : null };
+    }
+    if ($serverTargetKind === "linux") {
+      return { kind: "linux" };
     }
     return { kind: "windows" };
   }
@@ -612,12 +637,18 @@
       <div class="field-row">
         <span class="field-label">Server Target</span>
         <div style="display:flex; gap:1rem;">
-          <label style="display:flex; align-items:center; gap:0.35rem;">
-            <input type="radio" name="target" checked={$serverTargetKind === "windows"} onchange={() => onServerTargetChange("windows")} /> Windows
-          </label>
-          <label style="display:flex; align-items:center; gap:0.35rem;">
-            <input type="radio" name="target" checked={$serverTargetKind === "wsl"} onchange={() => onServerTargetChange("wsl")} /> WSL
-          </label>
+          {#if hostPlatform === "linux"}
+            <label style="display:flex; align-items:center; gap:0.35rem;">
+              <input type="radio" name="target" checked={$serverTargetKind === "linux"} onchange={() => onServerTargetChange("linux")} /> Linux (native)
+            </label>
+          {:else}
+            <label style="display:flex; align-items:center; gap:0.35rem;">
+              <input type="radio" name="target" checked={$serverTargetKind === "windows"} onchange={() => onServerTargetChange("windows")} /> Windows
+            </label>
+            <label style="display:flex; align-items:center; gap:0.35rem;">
+              <input type="radio" name="target" checked={$serverTargetKind === "wsl"} onchange={() => onServerTargetChange("wsl")} /> WSL
+            </label>
+          {/if}
         </div>
       </div>
       {#if $serverTargetKind === "wsl"}
@@ -681,7 +712,7 @@
       <p class="field-hint">Checking…</p>
     {:else if prereqs.length === 0}
       <p class="field-hint">
-        {#if $serverTargetKind === "wsl"}
+        {#if $serverTargetKind === "wsl" || $serverTargetKind === "linux"}
           Linux libraries are checked against the installed server binary — this appears once the
           server files have been downloaded.
         {:else}

@@ -37,7 +37,7 @@ export const useUpnp = writable<boolean>(true);
 export const installDir = writable<string | null>(null);
 export const steamCmdInstalled = writable<boolean>(false);
 
-export type ServerTargetKind = "windows" | "wsl";
+export type ServerTargetKind = "windows" | "wsl" | "linux";
 export const serverTargetKind = writable<ServerTargetKind>("windows");
 export const wslDistro = writable<string | null>(null);
 

@@ -85,6 +85,7 @@ pub fn run() {
             commands::install_prerequisite,
             commands::list_diagnostics,
             commands::list_common_issues,
+            commands::get_host_platform,
             commands::get_use_upnp,
             commands::set_use_upnp,
             commands::check_port_reachability,

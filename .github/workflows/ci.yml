@@ -54,3 +54,56 @@ jobs:
         working-directory: app/src-tauri
       - run: cargo clippy --all-targets --locked -- -D warnings
         working-directory: app/src-tauri
+
+  backend-linux:
+    name: Backend Linux (test + clippy + bundle)
+    # 22.04 rather than -latest: an older glibc baseline keeps the AppImage this job produces
+    # runnable on other distros (including Arch), matching the constraint on build.yml's release
+    # job.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri -> target
+      - name: Install Tauri Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf build-essential curl wget file libssl-dev libxdo-dev rpm
+      # `tauri::generate_context!()` checks at compile time that `frontendDist` (../build)
+      # exists, so the frontend has to be built before cargo can compile at all here.
+      - run: npm ci
+        working-directory: app
+      - run: npm run build
+        working-directory: app
+      - run: cargo test --locked
+        working-directory: app/src-tauri
+      - run: cargo clippy --all-targets --locked -- -D warnings
+        working-directory: app/src-tauri
+      # Full bundle build (not just cargo test/clippy) so this job also hands back a real,
+      # installable .deb/.rpm/AppImage from every push/PR — without publishing a GitHub Release,
+      # which only build.yml does, and only on push to main.
+      - run: npm run tauri build
+        working-directory: app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      - name: Upload Linux bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: longbow-linux-${{ github.sha }}
+          path: |
+            app/src-tauri/target/release/bundle/deb/*.deb
+            app/src-tauri/target/release/bundle/rpm/*.rpm
+            app/src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+          retention-days: 30

@@ -328,7 +328,7 @@ export function emptyLaunchArguments(): LaunchArguments {
   };
 }
 
-export type ServerTarget = { kind: "windows" } | { kind: "wsl"; distro: string | null };
+export type ServerTarget = { kind: "windows" } | { kind: "wsl"; distro: string | null } | { kind: "linux" };
 
 export async function isServerStarted(): Promise<boolean> {
   return invoke<boolean>("is_server_started");
@@ -421,6 +421,11 @@ export async function isWslAvailable(): Promise<boolean> {
 /** Installed WSL distribution names, for populating the WSL distro picker. */
 export async function listWslDistros(): Promise<string[]> {
   return invoke<string[]>("list_wsl_distros");
+}
+
+/** The host OS Longbow itself is running on (`"windows"` | `"linux"` | `"macos"`). */
+export async function getHostPlatform(): Promise<string> {
+  return invoke<string>("get_host_platform");
 }
 
 // ---------------------------------------------------------------------------

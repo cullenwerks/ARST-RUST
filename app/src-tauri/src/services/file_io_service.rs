@@ -9,6 +9,13 @@ use super::error::ServiceError;
 /// the map returned by [`FileIoService::get_saved_games`].
 const LATEST_SAVE_SENTINEL: &str = ".LatestSave";
 
+/// SteamCMD's own binary filename inside `{install_dir}/steamcmd/` — platform-specific: Windows
+/// ships `steamcmd.exe`, Linux ships a `steamcmd.sh` wrapper script (around `linux32/steamcmd`).
+#[cfg(target_os = "windows")]
+const STEAMCMD_BINARY: &str = "steamcmd.exe";
+#[cfg(unix)]
+const STEAMCMD_BINARY: &str = "steamcmd.sh";
+
 /// All file/IO operations for the server tool, ported from `Managers/FileIOManager.cs`.
 ///
 /// No singleton pattern, and no GUI: file/folder picking is a frontend concern now — every
@@ -34,11 +41,11 @@ impl FileIoService {
         self.install_dir.as_deref()
     }
 
-    /// `{install_dir}/steamcmd/steamcmd.exe`
+    /// `{install_dir}/steamcmd/steamcmd.exe` (or `steamcmd.sh` on Linux)
     pub fn steamcmd_exe_path(&self) -> Option<PathBuf> {
         self.install_dir
             .as_ref()
-            .map(|dir| dir.join("steamcmd").join("steamcmd.exe"))
+            .map(|dir| dir.join("steamcmd").join(STEAMCMD_BINARY))
     }
 
     /// `{install_dir}/saves/profile/.save/sessions`
@@ -134,11 +141,22 @@ impl FileIoService {
         }
     }
 
-    /// Validates that `path` contains both `{path}/steamcmd/steamcmd.exe` AND
-    /// `{path}/arma_reforger/ArmaReforgerServer.exe`.
+    /// The dedicated server binary's filename for a native install on the current host platform.
+    #[cfg(target_os = "windows")]
+    fn native_server_binary() -> &'static str {
+        super::process_service::WINDOWS_SERVER_BINARY
+    }
+    #[cfg(unix)]
+    fn native_server_binary() -> &'static str {
+        super::process_service::LINUX_SERVER_BINARY
+    }
+
+    /// Validates that `path` contains both the SteamCMD binary and the dedicated server binary
+    /// for the current host platform (e.g. on Windows, `{path}/steamcmd/steamcmd.exe` AND
+    /// `{path}/arma_reforger/ArmaReforgerServer.exe`).
     pub fn validate_server_install_dir(path: &Path) -> Result<(), ServiceError> {
-        let steamcmd = path.join("steamcmd").join("steamcmd.exe");
-        let server_exe = path.join("arma_reforger").join("ArmaReforgerServer.exe");
+        let steamcmd = path.join("steamcmd").join(STEAMCMD_BINARY);
+        let server_exe = path.join("arma_reforger").join(Self::native_server_binary());
 
         if steamcmd.exists() && server_exe.exists() {
             Ok(())
@@ -150,27 +168,72 @@ impl FileIoService {
         }
     }
 
-    /// Downloads `steamcmd.zip` from `download_url` and extracts it into
-    /// `{install_dir}/steamcmd/`, then deletes the temp zip.
-    pub async fn download_steam_cmd(&self, download_url: &str) -> Result<(), ServiceError> {
+    /// Downloads SteamCMD from `base_download_url` and extracts it into `{install_dir}/steamcmd/`,
+    /// then deletes the temp archive. `base_download_url` is the download host's base path (e.g.
+    /// `https://steamcdn-a.akamaihd.net/client/installer`) — the archive filename and format are
+    /// platform-specific (Windows: `steamcmd.zip`; Linux: `steamcmd_linux.tar.gz`), so that
+    /// decision is made here rather than by the caller.
+    pub async fn download_steam_cmd(&self, base_download_url: &str) -> Result<(), ServiceError> {
         let install_dir = self.install_dir.as_ref().ok_or_else(|| {
             ServiceError::Other("No install directory is set".to_string())
         })?;
 
-        let zip_file_path = install_dir.join("steamcmd.zip");
         let extract_path = install_dir.join("steamcmd");
-
         std::fs::create_dir_all(install_dir)?;
 
-        let response = reqwest::get(download_url).await?;
-        let bytes = response.error_for_status()?.bytes().await?;
-        std::fs::write(&zip_file_path, &bytes)?;
+        #[cfg(target_os = "windows")]
+        {
+            let archive_path = install_dir.join("steamcmd.zip");
+            let download_url = format!("{base_download_url}/steamcmd.zip");
+            let response = reqwest::get(&download_url).await?;
+            let bytes = response.error_for_status()?.bytes().await?;
+            std::fs::write(&archive_path, &bytes)?;
 
-        Self::extract_zip(&zip_file_path, &extract_path, true)?;
+            Self::extract_zip(&archive_path, &extract_path, true)?;
+            Self::delete_file_if_exists(&archive_path)?;
+        }
 
-        Self::delete_file_if_exists(&zip_file_path)?;
+        #[cfg(unix)]
+        {
+            let archive_path = install_dir.join("steamcmd_linux.tar.gz");
+            let download_url = format!("{base_download_url}/steamcmd_linux.tar.gz");
+            let response = reqwest::get(&download_url).await?;
+            let bytes = response.error_for_status()?.bytes().await?;
+            std::fs::write(&archive_path, &bytes)?;
+
+            Self::extract_tar_gz(&archive_path, &extract_path)?;
+            Self::delete_file_if_exists(&archive_path)?;
+
+            // Defensive: the tarball should already mark these executable, but don't rely on it.
+            Self::make_executable(&extract_path.join("steamcmd.sh"));
+            Self::make_executable(&extract_path.join("linux32").join("steamcmd"));
+        }
 
         Ok(())
+    }
+
+    /// Extracts a `.tar.gz` archive at `archive_path` into `dest_dir`, preserving the Unix
+    /// permission bits (executable) stored in the archive.
+    #[cfg(unix)]
+    fn extract_tar_gz(archive_path: &Path, dest_dir: &Path) -> Result<(), ServiceError> {
+        std::fs::create_dir_all(dest_dir)?;
+        let file = std::fs::File::open(archive_path)?;
+        let decoder = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+        archive.unpack(dest_dir)?;
+        Ok(())
+    }
+
+    /// Sets the executable bit on `path` if it exists. No-op (not an error) if it doesn't —
+    /// callers use this defensively on files an archive extraction should have already produced.
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mut perms = metadata.permissions();
+            perms.set_mode(perms.mode() | 0o111);
+            let _ = std::fs::set_permissions(path, perms);
+        }
     }
 
     /// Extracts the bundled `NoBackendScenarioLoader_6324F7124A9768FB.zip` resource into
@@ -364,8 +427,8 @@ mod tests {
         let arma_dir = dir.path().join("arma_reforger");
         std::fs::create_dir_all(&steamcmd_dir).unwrap();
         std::fs::create_dir_all(&arma_dir).unwrap();
-        std::fs::write(steamcmd_dir.join("steamcmd.exe"), b"").unwrap();
-        std::fs::write(arma_dir.join("ArmaReforgerServer.exe"), b"").unwrap();
+        std::fs::write(steamcmd_dir.join(STEAMCMD_BINARY), b"").unwrap();
+        std::fs::write(arma_dir.join(FileIoService::native_server_binary()), b"").unwrap();
 
         assert!(FileIoService::validate_server_install_dir(dir.path()).is_ok());
     }

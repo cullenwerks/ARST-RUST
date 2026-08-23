@@ -15,3 +15,10 @@ pub async fn list_diagnostics() -> Result<Vec<Diagnostic>, String> {
 pub async fn list_common_issues() -> Result<Vec<CommonIssue>, String> {
     Ok(diagnostics::common_issues().to_vec())
 }
+
+/// The host OS Longbow itself is running on (`"windows"` | `"linux"` | `"macos"`), so the
+/// frontend can decide which Server Target options make sense to offer.
+#[tauri::command]
+pub async fn get_host_platform() -> &'static str {
+    std::env::consts::OS
+}

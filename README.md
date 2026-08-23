@@ -11,7 +11,7 @@
   </a>
 </p>
 
-Create and manage Arma Reforger Dedicated Servers on Windows with this easy to use GUI tool.
+Create and manage Arma Reforger Dedicated Servers on Windows or Linux with this easy to use GUI tool.
 
 This is a Rust + [Tauri](https://tauri.app/) rewrite of the original C#/WinForms tool. The
 backend is Rust; the interface is Svelte + TypeScript running in a webview.
@@ -25,22 +25,29 @@ backend is Rust; the interface is Svelte + TypeScript running in a webview.
 - Streams SteamCMD and server output into an in-app log
 - Monitors your server and automatically restarts it if it crashes
 - Optional UPnP port forwarding
-- Run the dedicated server natively on Windows, or on Linux through WSL
+- Run the dedicated server natively on Windows, natively on Linux, or on Linux through WSL
 
 ## Requirements
 
-- Windows
+**Windows:**
 - [WebView2 runtime](https://developer.microsoft.com/microsoft-edge/webview2/) (preinstalled on
   current Windows 11 builds)
 - Any dependencies for the Arma Reforger Dedicated Server itself (namely the Microsoft Visual
   C++ Runtime)
 
+**Linux:**
+- A distro with WebKitGTK available (most mainstream distros, including Debian, Fedora, and
+  Arch)
+- The AppImage needs `fuse2` to run (`sudo pacman -S fuse2` on Arch); the `.deb`/`.rpm`
+  installers don't
+
 ## Download
 
 Every push to `main` builds and publishes a new [Release](https://github.com/cullenwerks/ARST-RUST/releases)
-automatically, tagged `vX.Y.Z-build.N` — grab the NSIS or MSI installer from the latest one.
-The installer isn't code-signed, so Windows SmartScreen will show an "unrecognized app"
-warning on first run — click "More info" → "Run anyway".
+automatically, tagged `vX.Y.Z-build.N` — grab the installer for your platform from the latest
+one (Windows: NSIS or MSI; Linux: `.deb`, `.rpm`, or the AppImage). The installer isn't
+code-signed, so Windows SmartScreen will show an "unrecognized app" warning on first run —
+click "More info" → "Run anyway".
 
 ## Server Parameters
 

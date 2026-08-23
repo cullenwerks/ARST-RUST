@@ -12,12 +12,7 @@ use crate::state::AppState;
 async fn server_working_dir(state: &tauri::State<'_, AppState>) -> Option<std::path::PathBuf> {
     let install_dir = state.file_io.lock().await.install_dir()?.to_path_buf();
     let use_experimental = state.config.lock().await.use_experimental_server;
-    let subdir = if use_experimental {
-        "arma_reforger\\experimental"
-    } else {
-        "arma_reforger"
-    };
-    Some(install_dir.join(subdir))
+    Some(crate::services::process_service::arma_working_dir(&install_dir, use_experimental))
 }
 
 /// Reports the runtime prerequisites for the given server target. Safe to call at any time —
@@ -37,6 +32,21 @@ pub async fn check_prerequisites(
             // false alarm — see `check_wsl_runtime`.
             match prereq_service::check_wsl_runtime(
                 distro.as_deref(),
+                &working_dir,
+                crate::services::process_service::LINUX_SERVER_BINARY,
+            )
+            .await
+            {
+                Ok(Some(prereq)) => Ok(vec![prereq]),
+                Ok(None) => Ok(Vec::new()),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        ServerTarget::Linux => {
+            let Some(working_dir) = server_working_dir(&state).await else {
+                return Ok(Vec::new());
+            };
+            match prereq_service::check_linux_runtime(
                 &working_dir,
                 crate::services::process_service::LINUX_SERVER_BINARY,
             )

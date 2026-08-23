@@ -138,6 +138,7 @@ fn failed_addon_names(line: &str, enabled: &[crate::models::Mod]) -> Option<Stri
 /// causes of a dedicated server failing to start on a freshly provisioned Windows machine (a
 /// VPS/VM used purely for hosting, which often lacks runtime redistributables a desktop install
 /// would already have) — not something specific to this app, but worth surfacing plainly.
+#[cfg(windows)]
 fn exit_code_hint(status: &std::process::ExitStatus) -> Option<&'static str> {
     const STATUS_DLL_NOT_FOUND: i32 = 0xC0000135u32 as i32;
     const STATUS_INVALID_IMAGE_FORMAT: i32 = 0xC000007Bu32 as i32;
@@ -150,6 +151,26 @@ fn exit_code_hint(status: &std::process::ExitStatus) -> Option<&'static str> {
         STATUS_INVALID_IMAGE_FORMAT => Some(
             "This usually means the downloaded server files are corrupted or incomplete — try \
              deleting the install directory and letting SteamCMD reinstall it.",
+        ),
+        _ => None,
+    }
+}
+
+/// Linux counterpart of the above: a missing shared library or an incompatible binary usually
+/// shows up as the process being killed by a signal rather than a distinctive exit code.
+#[cfg(unix)]
+fn exit_code_hint(status: &std::process::ExitStatus) -> Option<&'static str> {
+    use std::os::unix::process::ExitStatusExt;
+    match status.signal()? {
+        11 => Some(
+            "The server crashed with a segmentation fault (SIGSEGV) — this is usually caused \
+             by missing or incompatible shared libraries, or corrupted server files. Check the \
+             prerequisite libraries above, or try deleting the install directory and letting \
+             SteamCMD reinstall it.",
+        ),
+        6 => Some(
+            "The server aborted (SIGABRT) — this is usually caused by a missing runtime \
+             dependency. Check the prerequisite libraries above.",
         ),
         _ => None,
     }
@@ -223,7 +244,35 @@ pub const WINDOWS_SERVER_BINARY: &str = "ArmaReforgerServer.exe";
 fn server_exe_filename(target: &ServerTarget) -> &'static str {
     match target {
         ServerTarget::Windows => WINDOWS_SERVER_BINARY,
-        ServerTarget::Wsl { .. } => LINUX_SERVER_BINARY,
+        ServerTarget::Wsl { .. } | ServerTarget::Linux => LINUX_SERVER_BINARY,
+    }
+}
+
+/// `{install_dir}/arma_reforger[/experimental]` — the directory SteamCMD installs into and the
+/// server is launched from. A single source of truth for both, built with real `Path::join`
+/// calls (not a string containing a literal `\`, which only behaves as a separator on Windows).
+pub(crate) fn arma_working_dir(install_dir: &std::path::Path, use_experimental: bool) -> PathBuf {
+    let dir = install_dir.join("arma_reforger");
+    if use_experimental {
+        dir.join("experimental")
+    } else {
+        dir
+    }
+}
+
+/// Sets the executable bit on `path` if it isn't already set. SteamCMD-extracted binaries
+/// should already be executable (the tar extraction preserves Valve's archive permissions), but
+/// this is a cheap safety net before handing the path to the OS loader — the same role the WSL
+/// launch path's per-run `chmod +x` wrapper serves.
+#[cfg(unix)]
+fn ensure_executable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mut perms = metadata.permissions();
+        if perms.mode() & 0o111 != 0o111 {
+            perms.set_mode(perms.mode() | 0o111);
+            let _ = std::fs::set_permissions(path, perms);
+        }
     }
 }
 
@@ -458,12 +507,7 @@ impl ProcessService {
     ) -> Result<(), ServiceError> {
         // Derived once and shared with the launch step below, so the directory SteamCMD
         // installs into can never disagree with the one the server is launched from.
-        let arma_subdir = if ctx.use_experimental {
-            "arma_reforger\\experimental"
-        } else {
-            "arma_reforger"
-        };
-        let server_working_dir = ctx.install_dir.join(arma_subdir);
+        let server_working_dir = arma_working_dir(&ctx.install_dir, ctx.use_experimental);
         let server_exe = server_working_dir.join(server_exe_filename(&ctx.server_target));
 
         if let Some(provider) = cloud_sync_provider(&ctx.install_dir) {
@@ -563,6 +607,17 @@ impl ProcessService {
                 {
                     Ok(Some(prereq)) => vec![prereq],
                     // An inconclusive or failed check is not evidence of a problem.
+                    Ok(None) | Err(_) => Vec::new(),
+                }
+            }
+            ServerTarget::Linux => {
+                match crate::services::prereq_service::check_linux_runtime(
+                    server_working_dir,
+                    LINUX_SERVER_BINARY,
+                )
+                .await
+                {
+                    Ok(Some(prereq)) => vec![prereq],
                     Ok(None) | Err(_) => Vec::new(),
                 }
             }
@@ -677,8 +732,11 @@ impl ProcessService {
 
         self.emit(log_line("Starting the dedicated server..."));
 
+        #[cfg(unix)]
+        ensure_executable(server_exe);
+
         let mut server_cmd = match &ctx.server_target {
-            ServerTarget::Windows => {
+            ServerTarget::Windows | ServerTarget::Linux => {
                 let mut c = Command::new(server_exe);
                 c.current_dir(server_working_dir);
                 c.args(&launch_args);
@@ -695,6 +753,11 @@ impl ProcessService {
             const CREATE_NO_WINDOW: u32 = 0x08000000;
             server_cmd.creation_flags(CREATE_NO_WINDOW);
         }
+        // Detach the child into its own process group, so `kill_server_blocking` can kill the
+        // whole tree at app shutdown by signalling the negated PID rather than just the one
+        // immediate child (which alone wouldn't reach anything it spawned in turn).
+        #[cfg(unix)]
+        server_cmd.process_group(0);
 
         let mut server_child = server_cmd.spawn().map_err(ServiceError::Io)?;
         let server_stdout = server_child.stdout.take();
@@ -939,11 +1002,25 @@ impl ProcessService {
 
         // `taskkill /T` takes the whole process tree, which also covers the `wsl.exe` wrapper
         // used by the Linux server target.
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+
+        // The server is spawned as its own process-group leader (see `launch_server`), so
+        // signalling the negated PID reaches the whole group in one shot.
+        #[cfg(unix)]
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &format!("-{pid}")])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
     }
 
 }
@@ -1041,22 +1118,21 @@ mod tests {
     #[test]
     fn steamcmd_install_dir_matches_the_server_launch_dir() {
         // The install path SteamCMD is given and the directory the server is launched from are
-        // derived from the same expression, so they cannot drift apart. Previously SteamCMD got
-        // a *relative* `..\Arma_Reforger` that only resolved correctly if the process happened
-        // to have the steamcmd folder as its working directory.
-        let install_dir = PathBuf::from(r"C:\Arma Server");
+        // derived from the same helper, so they cannot drift apart. Previously SteamCMD got a
+        // *relative* `..\Arma_Reforger` that only resolved correctly if the process happened to
+        // have the steamcmd folder as its working directory.
+        //
+        // Built from the real cwd rather than a hardcoded `C:\...` literal so the `is_absolute()`
+        // check below is meaningful on both Windows and Unix path semantics.
+        let install_dir = std::env::current_dir().unwrap().join("Arma Server");
 
-        for (experimental, expected_subdir) in
-            [(false, "arma_reforger"), (true, r"arma_reforger\experimental")]
-        {
-            let subdir = if experimental {
-                "arma_reforger\\experimental"
-            } else {
-                "arma_reforger"
-            };
-            let server_working_dir = install_dir.join(subdir);
+        for (experimental, expected) in [
+            (false, install_dir.join("arma_reforger")),
+            (true, install_dir.join("arma_reforger").join("experimental")),
+        ] {
+            let server_working_dir = arma_working_dir(&install_dir, experimental);
 
-            assert_eq!(server_working_dir, install_dir.join(expected_subdir));
+            assert_eq!(server_working_dir, expected);
             assert!(server_working_dir.is_absolute());
             // Passing this as a single argv entry is what keeps the space in "Arma Server"
             // intact; it must never be whitespace-split.
@@ -1091,6 +1167,7 @@ mod tests {
         assert_eq!(failed_addon_names("Addon loading failed {5B383D4C", &[]), None);
     }
 
+    #[cfg(windows)]
     #[test]
     fn exit_code_hint_recognizes_known_windows_startup_failures() {
         use std::os::windows::process::ExitStatusExt;
@@ -1105,10 +1182,26 @@ mod tests {
         assert_eq!(exit_code_hint(&clean_exit), None);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn exit_code_hint_recognizes_known_crash_signals() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let segfault = std::process::ExitStatus::from_raw(11); // raw wait() status: signal 11, no core dump
+        assert!(exit_code_hint(&segfault).unwrap().contains("segmentation fault"));
+
+        let abort = std::process::ExitStatus::from_raw(6);
+        assert!(exit_code_hint(&abort).unwrap().contains("aborted"));
+
+        let clean_exit = std::process::ExitStatus::from_raw(0);
+        assert_eq!(exit_code_hint(&clean_exit), None);
+    }
+
     #[test]
     fn server_exe_filename_is_platform_specific() {
         assert_eq!(server_exe_filename(&ServerTarget::Windows), "ArmaReforgerServer.exe");
         assert_eq!(server_exe_filename(&ServerTarget::Wsl { distro: None }), "ArmaReforgerServer");
+        assert_eq!(server_exe_filename(&ServerTarget::Linux), "ArmaReforgerServer");
     }
 
     #[test]
