@@ -47,6 +47,13 @@ async fn build_start_context(
     launch_arguments: LaunchArguments,
     server_target: ServerTarget,
 ) -> Result<StartServerContext, String> {
+    if !server_target.is_supported_on_this_host() {
+        return Err(format!(
+            "The {} server target isn't available on this build of Longbow.",
+            server_target.display_name()
+        ));
+    }
+
     let mut launch_arguments = launch_arguments;
 
     let file_io = state.file_io.lock().await;
@@ -219,4 +226,12 @@ pub async fn is_wsl_available() -> bool {
 #[tauri::command]
 pub async fn list_wsl_distros() -> Result<Vec<String>, String> {
     wsl_service::list_distros().await.map_err(|e| e.to_string())
+}
+
+/// The OS Longbow itself is running on (`"windows"` or `"linux"`), so the frontend can force the
+/// Server Target selection and grey out whichever options this build can't possibly run — a
+/// Linux build can neither launch a Windows binary nor shell out to `wsl.exe`.
+#[tauri::command]
+pub fn host_os() -> &'static str {
+    std::env::consts::OS
 }

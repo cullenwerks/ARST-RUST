@@ -1,6 +1,7 @@
 //! Support for running the Arma Reforger dedicated server under WSL (Windows Subsystem for
-//! Linux) as an alternative to a native Windows install. New in the Rust port — the C#
-//! original was Windows-native only.
+//! Linux) as an alternative to a native Windows install, plus the [`ServerTarget`] enum shared
+//! by every launch target (including native Linux, when Longbow itself runs on Linux). New in
+//! the Rust port — the C# original was Windows-native only.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -19,6 +20,9 @@ pub enum ServerTarget {
     /// Linux server, launched inside WSL. `distro` selects a specific WSL distribution
     /// (`wsl -d <distro> -- ...`); `None` uses the default distro.
     Wsl { distro: Option<String> },
+    /// Native Linux server, launched directly. Only reachable when Longbow itself is running on
+    /// Linux — see `host_os`/the backend guard in `build_start_context` and `check_prerequisites`.
+    Linux,
 }
 
 
@@ -89,15 +93,46 @@ pub fn windows_path_to_wsl(path: &Path) -> String {
     }
 }
 
+impl ServerTarget {
+    /// Whether this target can possibly run given whatever OS Longbow itself is compiled for.
+    /// `Windows`/`Wsl` both need Windows-side tooling (the native loader, `wsl.exe`) that simply
+    /// doesn't exist on a Linux build; a bare native `Linux` target only makes sense when Longbow
+    /// itself is the Linux process doing the launching, not cross-launched from Windows (that's
+    /// what the `Wsl` variant is for).
+    ///
+    /// This is a defense-in-depth backend check — the primary lockout is the frontend disabling
+    /// the unavailable radio options once it learns the host OS via the `host_os` command — so
+    /// stale or hand-edited persisted state can't be used to attempt an impossible launch.
+    pub fn is_supported_on_this_host(&self) -> bool {
+        if cfg!(target_os = "windows") {
+            !matches!(self, ServerTarget::Linux)
+        } else {
+            matches!(self, ServerTarget::Linux)
+        }
+    }
+
+    /// Short, human-readable name for error messages.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            ServerTarget::Windows => "Windows",
+            ServerTarget::Wsl { .. } => "WSL",
+            ServerTarget::Linux => "Linux",
+        }
+    }
+}
+
 /// Renders a Windows path in the form a process running on `target` can actually open.
 ///
 /// A server running under WSL is a Linux process: a `C:\...` argument means nothing to it, so
 /// paths handed to it as launch arguments have to be in `/mnt/<drive>/...` form. This applies
 /// only to paths *given to the server*; paths Longbow itself reads and writes stay Windows paths,
 /// since Longbow is always the Windows-side process.
+///
+/// A native `Linux` target needs no translation at all: there Longbow itself is the Linux
+/// process, so the paths it already holds are native Linux paths shared with the server.
 pub fn path_for_target(target: &ServerTarget, path: &Path) -> String {
     match target {
-        ServerTarget::Windows => path.display().to_string(),
+        ServerTarget::Windows | ServerTarget::Linux => path.display().to_string(),
         ServerTarget::Wsl { .. } => windows_path_to_wsl(path),
     }
 }
@@ -231,6 +266,26 @@ mod tests {
             path_for_target(&ServerTarget::Wsl { distro: None }, &config),
             "/mnt/c/Users/Culle/Documents/reforger/server.json"
         );
+        assert_eq!(
+            path_for_target(&ServerTarget::Linux, &config),
+            r"C:\Users\Culle\Documents\reforger\server.json"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_and_wsl_are_supported_on_a_windows_host_but_not_linux() {
+        assert!(ServerTarget::Windows.is_supported_on_this_host());
+        assert!(ServerTarget::Wsl { distro: None }.is_supported_on_this_host());
+        assert!(!ServerTarget::Linux.is_supported_on_this_host());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn only_linux_is_supported_on_a_non_windows_host() {
+        assert!(!ServerTarget::Windows.is_supported_on_this_host());
+        assert!(!ServerTarget::Wsl { distro: None }.is_supported_on_this_host());
+        assert!(ServerTarget::Linux.is_supported_on_this_host());
     }
 
     #[test]

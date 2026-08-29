@@ -9,6 +9,12 @@ use super::error::ServiceError;
 /// the map returned by [`FileIoService::get_saved_games`].
 const LATEST_SAVE_SENTINEL: &str = ".LatestSave";
 
+/// SteamCMD's own launcher binary name for whichever OS Longbow itself is running on.
+#[cfg(target_os = "windows")]
+const STEAMCMD_BINARY: &str = "steamcmd.exe";
+#[cfg(not(target_os = "windows"))]
+const STEAMCMD_BINARY: &str = "steamcmd.sh";
+
 /// All file/IO operations for the server tool, ported from `Managers/FileIOManager.cs`.
 ///
 /// No singleton pattern, and no GUI: file/folder picking is a frontend concern now — every
@@ -34,11 +40,14 @@ impl FileIoService {
         self.install_dir.as_deref()
     }
 
-    /// `{install_dir}/steamcmd/steamcmd.exe`
+    /// `{install_dir}/steamcmd/steamcmd.exe` on Windows, `{install_dir}/steamcmd/steamcmd.sh`
+    /// elsewhere. SteamCMD's own binary is always native to whichever OS Longbow itself is
+    /// running on — unlike the *managed dedicated server* binary, whose name depends on the
+    /// chosen [`super::wsl_service::ServerTarget`] instead.
     pub fn steamcmd_exe_path(&self) -> Option<PathBuf> {
         self.install_dir
             .as_ref()
-            .map(|dir| dir.join("steamcmd").join("steamcmd.exe"))
+            .map(|dir| dir.join("steamcmd").join(STEAMCMD_BINARY))
     }
 
     /// `{install_dir}/saves/profile/.save/sessions`
@@ -134,13 +143,17 @@ impl FileIoService {
         }
     }
 
-    /// Validates that `path` contains both `{path}/steamcmd/steamcmd.exe` AND
-    /// `{path}/arma_reforger/ArmaReforgerServer.exe`.
+    /// Validates that `path` contains both `{path}/steamcmd/{steamcmd binary}` AND
+    /// `{path}/arma_reforger/ArmaReforgerServer[.exe]` — the server binary is checked under
+    /// either name since the install may hold either depot (e.g. a Windows host that previously
+    /// downloaded the Linux depot for a WSL target has the extension-less binary, not `.exe`).
     pub fn validate_server_install_dir(path: &Path) -> Result<(), ServiceError> {
-        let steamcmd = path.join("steamcmd").join("steamcmd.exe");
-        let server_exe = path.join("arma_reforger").join("ArmaReforgerServer.exe");
+        let steamcmd = path.join("steamcmd").join(STEAMCMD_BINARY);
+        let arma_dir = path.join("arma_reforger");
+        let server_exe_exists =
+            arma_dir.join("ArmaReforgerServer.exe").exists() || arma_dir.join("ArmaReforgerServer").exists();
 
-        if steamcmd.exists() && server_exe.exists() {
+        if steamcmd.exists() && server_exe_exists {
             Ok(())
         } else {
             Err(ServiceError::Other(format!(
@@ -150,25 +163,57 @@ impl FileIoService {
         }
     }
 
-    /// Downloads `steamcmd.zip` from `download_url` and extracts it into
-    /// `{install_dir}/steamcmd/`, then deletes the temp zip.
+    /// Downloads the SteamCMD archive from `download_url` and extracts it into
+    /// `{install_dir}/steamcmd/`, then deletes the temp archive. The archive format is native to
+    /// whichever OS Longbow itself is running on: a `.zip` on Windows (extracted in-process via
+    /// the `zip` crate), a `.tar.gz` everywhere else (extracted by shelling out to `tar`, which
+    /// ships with effectively every Linux desktop — not worth a second archive-format dependency
+    /// for).
     pub async fn download_steam_cmd(&self, download_url: &str) -> Result<(), ServiceError> {
         let install_dir = self.install_dir.as_ref().ok_or_else(|| {
             ServiceError::Other("No install directory is set".to_string())
         })?;
 
-        let zip_file_path = install_dir.join("steamcmd.zip");
         let extract_path = install_dir.join("steamcmd");
-
         std::fs::create_dir_all(install_dir)?;
 
         let response = reqwest::get(download_url).await?;
         let bytes = response.error_for_status()?.bytes().await?;
-        std::fs::write(&zip_file_path, &bytes)?;
 
-        Self::extract_zip(&zip_file_path, &extract_path, true)?;
-
-        Self::delete_file_if_exists(&zip_file_path)?;
+        #[cfg(target_os = "windows")]
+        {
+            let archive_path = install_dir.join("steamcmd.zip");
+            std::fs::write(&archive_path, &bytes)?;
+            Self::extract_zip(&archive_path, &extract_path, true)?;
+            Self::delete_file_if_exists(&archive_path)?;
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let archive_path = install_dir.join("steamcmd_linux.tar.gz");
+            std::fs::write(&archive_path, &bytes)?;
+            std::fs::create_dir_all(&extract_path)?;
+            let status = std::process::Command::new("tar")
+                .args(["-xzf"])
+                .arg(&archive_path)
+                .arg("-C")
+                .arg(&extract_path)
+                .status()?;
+            Self::delete_file_if_exists(&archive_path)?;
+            if !status.success() {
+                return Err(ServiceError::Other(format!(
+                    "Failed to extract the SteamCMD archive (tar exited with {status})"
+                )));
+            }
+            // Belt-and-suspenders: the official archive already ships steamcmd.sh executable,
+            // and `tar` preserves that bit, but a mounted/overlay filesystem can still strip it.
+            use std::os::unix::fs::PermissionsExt;
+            let steamcmd_sh = extract_path.join(STEAMCMD_BINARY);
+            if let Ok(metadata) = std::fs::metadata(&steamcmd_sh) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(perms.mode() | 0o111);
+                let _ = std::fs::set_permissions(&steamcmd_sh, perms);
+            }
+        }
 
         Ok(())
     }
@@ -364,8 +409,24 @@ mod tests {
         let arma_dir = dir.path().join("arma_reforger");
         std::fs::create_dir_all(&steamcmd_dir).unwrap();
         std::fs::create_dir_all(&arma_dir).unwrap();
-        std::fs::write(steamcmd_dir.join("steamcmd.exe"), b"").unwrap();
+        std::fs::write(steamcmd_dir.join(STEAMCMD_BINARY), b"").unwrap();
         std::fs::write(arma_dir.join("ArmaReforgerServer.exe"), b"").unwrap();
+
+        assert!(FileIoService::validate_server_install_dir(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn validate_server_install_dir_valid_with_extensionless_linux_binary() {
+        // Regression: an install directory holding the Linux depot (e.g. previously downloaded
+        // for a WSL target) has `ArmaReforgerServer` with no extension, not `.exe` — this must
+        // still validate rather than reporting the install as missing.
+        let dir = tempfile::tempdir().unwrap();
+        let steamcmd_dir = dir.path().join("steamcmd");
+        let arma_dir = dir.path().join("arma_reforger");
+        std::fs::create_dir_all(&steamcmd_dir).unwrap();
+        std::fs::create_dir_all(&arma_dir).unwrap();
+        std::fs::write(steamcmd_dir.join(STEAMCMD_BINARY), b"").unwrap();
+        std::fs::write(arma_dir.join("ArmaReforgerServer"), b"").unwrap();
 
         assert!(FileIoService::validate_server_install_dir(dir.path()).is_ok());
     }

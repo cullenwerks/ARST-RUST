@@ -5,7 +5,7 @@
   import ManagementTab from "$lib/components/tabs/ManagementTab.svelte";
   import StatusTab from "$lib/components/tabs/StatusTab.svelte";
   import RconTab from "$lib/components/tabs/RconTab.svelte";
-  import { SERVER_EVENT, RCON_EVENT, type ProcessEvent, type RconEvent } from "$lib/api";
+  import { SERVER_EVENT, RCON_EVENT, type ProcessEvent, type RconEvent, hostOs as fetchHostOs } from "$lib/api";
   import {
     appendLogLine,
     pushStatus,
@@ -17,6 +17,8 @@
     rconConnected,
     rconPlayers,
     appendRconLine,
+    hostOs,
+    serverTargetKind,
   } from "$lib/stores";
 
   type TabId = "configuration" | "management" | "status" | "rcon";
@@ -33,6 +35,19 @@
   let unlistenRcon: UnlistenFn | undefined;
 
   onMount(async () => {
+    fetchHostOs()
+      .then((os) => {
+        hostOs.set(os);
+        // A Linux build can neither launch a Windows binary nor shell out to `wsl.exe`, so the
+        // only sensible Server Target there is native Linux — force it rather than leaving the
+        // in-memory default of "windows" selected underneath a disabled radio.
+        if (os === "linux") serverTargetKind.set("linux");
+      })
+      .catch(() => {
+        // Leave hostOs as null — the Management tab treats that as "unknown yet" and doesn't
+        // lock anything out rather than guessing wrong.
+      });
+
     unlisten = await listen<ProcessEvent>(SERVER_EVENT, (event) => {
       const payload = event.payload;
       switch (payload.type) {

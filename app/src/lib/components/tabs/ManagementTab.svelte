@@ -52,6 +52,7 @@
     steamCmdInstalled,
     serverTargetKind,
     wslDistro,
+    hostOs,
     serverRunning,
     serverBusy,
     buttonIcon,
@@ -392,7 +393,7 @@
     persistConfigFlags();
   }
 
-  function onServerTargetChange(kind: "windows" | "wsl") {
+  function onServerTargetChange(kind: "windows" | "wsl" | "linux") {
     serverTargetKind.set(kind);
     if (kind === "wsl") {
       ensureWslChecked();
@@ -463,6 +464,9 @@
   function currentServerTarget(): ServerTarget {
     if ($serverTargetKind === "wsl") {
       return { kind: "wsl", distro: $wslDistro && $wslDistro.trim().length > 0 ? $wslDistro : null };
+    }
+    if ($serverTargetKind === "linux") {
+      return { kind: "linux" };
     }
     return { kind: "windows" };
   }
@@ -611,14 +615,46 @@
     <div class="grid-2" style="margin-top:0.6rem;">
       <div class="field-row">
         <span class="field-label">Server Target</span>
-        <div style="display:flex; gap:1rem;">
+        <div style="display:flex; gap:1rem; flex-wrap:wrap; align-items:center;">
           <label style="display:flex; align-items:center; gap:0.35rem;">
-            <input type="radio" name="target" checked={$serverTargetKind === "windows"} onchange={() => onServerTargetChange("windows")} /> Windows
+            <input
+              type="radio"
+              name="target"
+              checked={$serverTargetKind === "windows"}
+              disabled={$hostOs === "linux"}
+              onchange={() => onServerTargetChange("windows")}
+            /> Windows
           </label>
           <label style="display:flex; align-items:center; gap:0.35rem;">
-            <input type="radio" name="target" checked={$serverTargetKind === "wsl"} onchange={() => onServerTargetChange("wsl")} /> WSL
+            <input
+              type="radio"
+              name="target"
+              checked={$serverTargetKind === "wsl"}
+              disabled={$hostOs === "linux"}
+              onchange={() => onServerTargetChange("wsl")}
+            /> WSL
+          </label>
+          <label style="display:flex; align-items:center; gap:0.35rem;">
+            <input
+              type="radio"
+              name="target"
+              checked={$serverTargetKind === "linux"}
+              disabled={$hostOs === "windows"}
+              onchange={() => onServerTargetChange("linux")}
+            /> Linux (native)
           </label>
         </div>
+        {#if $hostOs === "linux"}
+          <span class="field-hint">
+            Longbow is running on Linux, so it can't launch a Windows binary or WSL — only the
+            native Linux server target is available.
+          </span>
+        {:else if $hostOs === "windows"}
+          <span class="field-hint">
+            Native Linux is only available when Longbow itself runs on Linux — on Windows, run
+            the Linux server via WSL instead.
+          </span>
+        {/if}
       </div>
       {#if $serverTargetKind === "wsl"}
         <div class="field-row">

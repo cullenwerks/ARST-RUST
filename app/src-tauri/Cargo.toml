@@ -4,7 +4,7 @@ name = "app"
 # `version` field in the release's latest.json, so a mismatch here would make every build think
 # an update (or downgrade) is available.
 version = "1.2.0"
-description = "A Tauri App"
+description = "GUI tool for hosting Arma Reforger dedicated servers"
 authors = ["you"]
 edition = "2021"
 
@@ -39,7 +39,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 sysinfo = "0.33"
-winreg = "0.52"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
