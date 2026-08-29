@@ -169,6 +169,55 @@ pub async fn check_wsl_runtime(
     }
 }
 
+/// Asks the dynamic linker directly (no WSL wrapper) which shared libraries the native Linux
+/// server binary needs and can't resolve, via `ldd`. This is the native-Linux counterpart of
+/// [`check_wsl_runtime`] — same idea, but Longbow itself is already the Linux process here, so
+/// `ldd` runs straight against the local filesystem instead of through `wsl.exe`.
+///
+/// Returns `Ok(None)` when the check couldn't be run at all (binary not installed yet, `ldd`
+/// absent) — an inconclusive check must not be reported to the user as a failure.
+pub async fn check_linux_runtime(
+    server_working_dir: &Path,
+    server_binary: &str,
+) -> Result<Option<Prerequisite>, ServiceError> {
+    let output = tokio::process::Command::new("ldd")
+        .arg(format!("./{server_binary}"))
+        .current_dir(server_working_dir)
+        .output()
+        .await
+        .map_err(ServiceError::Io)?;
+
+    if !output.status.success() {
+        // `ldd` missing, binary not there yet, or not a dynamic executable — nothing conclusive.
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let missing = parse_ldd_missing(&stdout);
+
+    if missing.is_empty() {
+        Ok(Some(Prerequisite::satisfied(
+            "linux-libs",
+            "Linux shared libraries",
+            "All shared libraries the server needs are present.",
+        )))
+    } else {
+        let install_hint = format!(
+            "Install them with your distribution's package manager, then try again (e.g. on \
+             Fedora, `sudo dnf install {}` — search for the package providing each library if a \
+             name isn't recognised).",
+            missing.join(" ")
+        );
+        Ok(Some(Prerequisite::missing(
+            "linux-libs",
+            "Linux shared libraries",
+            missing,
+            &install_hint,
+            false,
+        )))
+    }
+}
+
 /// Extracts the library names `ldd` reported as unresolvable. Its output lists one library per
 /// line as `name => path (addr)`, with the path replaced by the literal `not found` when the
 /// linker couldn't resolve it.
@@ -252,6 +301,14 @@ mod tests {
         let output = "\tlinux-vdso.so.1 (0x00007ffd8d5f9000)\n\
                       \tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f8a2c000000)\n";
         assert!(parse_ldd_missing(output).is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn check_linux_runtime_is_inconclusive_when_binary_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = check_linux_runtime(dir.path(), "ArmaReforgerServer").await.unwrap();
+        assert!(result.is_none());
     }
 
     #[test]

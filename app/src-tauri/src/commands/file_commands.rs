@@ -92,10 +92,18 @@ pub async fn download_steam_cmd(
 ) -> Result<(), String> {
     // Read the URL first and release that lock before taking `file_io`, so this path locks in
     // the same order as every other command (file_io is never held while acquiring another).
+    // The archive name is native to whichever OS Longbow itself runs on — see
+    // `FileIoService::download_steam_cmd`'s doc comment for why this isn't tied to the
+    // chosen server target.
+    #[cfg(target_os = "windows")]
+    const STEAMCMD_ARCHIVE: &str = "steamcmd.zip";
+    #[cfg(not(target_os = "windows"))]
+    const STEAMCMD_ARCHIVE: &str = "steamcmd_linux.tar.gz";
+
     let download_url = {
         let tool_properties = state.tool_properties.lock().await;
         format!(
-            "{}/steamcmd.zip",
+            "{}/{STEAMCMD_ARCHIVE}",
             tool_properties.properties().steam_cmd_download_url
         )
     };

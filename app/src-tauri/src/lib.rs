@@ -81,6 +81,7 @@ pub fn run() {
             commands::build_launch_arguments_preview,
             commands::is_wsl_available,
             commands::list_wsl_distros,
+            commands::host_os,
             commands::check_prerequisites,
             commands::install_prerequisite,
             commands::list_diagnostics,

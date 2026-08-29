@@ -29,8 +29,12 @@ jobs:
         working-directory: app
 
   backend:
-    name: Backend (test + clippy)
-    runs-on: windows-latest
+    name: Backend (test + clippy, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -44,6 +48,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: app/src-tauri -> target
+      # Standard Tauri v2 Linux build prerequisites — webkit2gtk/gtk3 for the webview, appindicator
+      # for the tray icon, librsvg for icon rendering.
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential libssl-dev
       # `tauri::generate_context!()` checks at compile time that `frontendDist` (../build)
       # exists, so the frontend has to be built before cargo can compile at all here.
       - run: npm ci

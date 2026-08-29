@@ -328,7 +328,10 @@ export function emptyLaunchArguments(): LaunchArguments {
   };
 }
 
-export type ServerTarget = { kind: "windows" } | { kind: "wsl"; distro: string | null };
+export type ServerTarget =
+  | { kind: "windows" }
+  | { kind: "wsl"; distro: string | null }
+  | { kind: "linux" };
 
 export async function isServerStarted(): Promise<boolean> {
   return invoke<boolean>("is_server_started");
@@ -421,6 +424,15 @@ export async function isWslAvailable(): Promise<boolean> {
 /** Installed WSL distribution names, for populating the WSL distro picker. */
 export async function listWslDistros(): Promise<string[]> {
   return invoke<string[]>("list_wsl_distros");
+}
+
+/**
+ * The OS Longbow itself is running on. Used to force the Server Target selection and grey out
+ * whichever options this build can't possibly run — a Linux build can neither launch a Windows
+ * binary nor shell out to `wsl.exe`.
+ */
+export async function hostOs(): Promise<"windows" | "linux"> {
+  return invoke<"windows" | "linux">("host_os");
 }
 
 // ---------------------------------------------------------------------------

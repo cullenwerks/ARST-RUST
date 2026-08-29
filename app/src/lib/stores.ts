@@ -37,9 +37,14 @@ export const useUpnp = writable<boolean>(true);
 export const installDir = writable<string | null>(null);
 export const steamCmdInstalled = writable<boolean>(false);
 
-export type ServerTargetKind = "windows" | "wsl";
+export type ServerTargetKind = "windows" | "wsl" | "linux";
 export const serverTargetKind = writable<ServerTargetKind>("windows");
 export const wslDistro = writable<string | null>(null);
+
+// Which OS Longbow itself is running on, resolved once at startup (see `+page.svelte`). `null`
+// until that resolves; used to lock the Server Target selection to what this build can actually
+// run.
+export const hostOs = writable<"windows" | "linux" | null>(null);
 
 // --- Server running / process state -----------------------------------------------------
 

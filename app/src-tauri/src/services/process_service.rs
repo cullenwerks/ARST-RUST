@@ -223,7 +223,20 @@ pub const WINDOWS_SERVER_BINARY: &str = "ArmaReforgerServer.exe";
 fn server_exe_filename(target: &ServerTarget) -> &'static str {
     match target {
         ServerTarget::Windows => WINDOWS_SERVER_BINARY,
-        ServerTarget::Wsl { .. } => LINUX_SERVER_BINARY,
+        ServerTarget::Wsl { .. } | ServerTarget::Linux => LINUX_SERVER_BINARY,
+    }
+}
+
+/// `{install_dir}/arma_reforger[/experimental]`, built as separate path components rather than
+/// one string with an embedded `\experimental` — a literal backslash is a path separator on
+/// Windows but just another filename character on Linux, so a single-component string here would
+/// silently create/look for a directory literally named `arma_reforger\experimental` there.
+pub fn server_install_subdir(install_dir: &std::path::Path, use_experimental: bool) -> PathBuf {
+    let dir = install_dir.join("arma_reforger");
+    if use_experimental {
+        dir.join("experimental")
+    } else {
+        dir
     }
 }
 
@@ -233,7 +246,7 @@ fn server_exe_filename(target: &ServerTarget) -> &'static str {
 /// on disk that the WSL launch step could execute.
 fn build_steamcmd_args(server_target: &ServerTarget, working_dir: &std::path::Path, app_id: &str) -> Vec<String> {
     let mut args = Vec::new();
-    if matches!(server_target, ServerTarget::Wsl { .. }) {
+    if matches!(server_target, ServerTarget::Wsl { .. } | ServerTarget::Linux) {
         args.push("+@sSteamCmdForcePlatformType".to_string());
         args.push("linux".to_string());
     }
@@ -458,12 +471,7 @@ impl ProcessService {
     ) -> Result<(), ServiceError> {
         // Derived once and shared with the launch step below, so the directory SteamCMD
         // installs into can never disagree with the one the server is launched from.
-        let arma_subdir = if ctx.use_experimental {
-            "arma_reforger\\experimental"
-        } else {
-            "arma_reforger"
-        };
-        let server_working_dir = ctx.install_dir.join(arma_subdir);
+        let server_working_dir = server_install_subdir(&ctx.install_dir, ctx.use_experimental);
         let server_exe = server_working_dir.join(server_exe_filename(&ctx.server_target));
 
         if let Some(provider) = cloud_sync_provider(&ctx.install_dir) {
@@ -563,6 +571,17 @@ impl ProcessService {
                 {
                     Ok(Some(prereq)) => vec![prereq],
                     // An inconclusive or failed check is not evidence of a problem.
+                    Ok(None) | Err(_) => Vec::new(),
+                }
+            }
+            ServerTarget::Linux => {
+                match crate::services::prereq_service::check_linux_runtime(
+                    server_working_dir,
+                    LINUX_SERVER_BINARY,
+                )
+                .await
+                {
+                    Ok(Some(prereq)) => vec![prereq],
                     Ok(None) | Err(_) => Vec::new(),
                 }
             }
@@ -686,6 +705,24 @@ impl ProcessService {
             }
             ServerTarget::Wsl { distro } => {
                 wsl_command(distro.as_deref(), server_working_dir, server_exe_filename(&ctx.server_target), &launch_args)
+            }
+            ServerTarget::Linux => {
+                // SteamCMD-extracted Linux binaries aren't reliably marked executable (e.g. a
+                // fresh install), so set the bit ourselves before spawning — the same safety net
+                // `wsl_command`'s chmod wrapper applies for the WSL target.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(metadata) = std::fs::metadata(server_exe) {
+                        let mut perms = metadata.permissions();
+                        perms.set_mode(perms.mode() | 0o111);
+                        let _ = std::fs::set_permissions(server_exe, perms);
+                    }
+                }
+                let mut c = Command::new(server_exe);
+                c.current_dir(server_working_dir);
+                c.args(&launch_args);
+                c
             }
         };
         server_cmd.stdout(std::process::Stdio::piped());
@@ -937,15 +974,30 @@ impl ProcessService {
 
         let Some(pid) = pid else { return };
 
-        // `taskkill /T` takes the whole process tree, which also covers the `wsl.exe` wrapper
-        // used by the Linux server target.
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        kill_pid_tree(pid);
     }
 
+}
+
+/// Kills `pid` and its whole process tree — on Windows via `taskkill /T`, which also takes the
+/// `wsl.exe` wrapper used by the WSL server target along with it. Native Linux launches the
+/// server directly with no wrapper process, so a plain `kill` of the one pid is enough there.
+#[cfg(target_os = "windows")]
+fn kill_pid_tree(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn kill_pid_tree(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 /// Polls a cancellation flag; used to make the daily-restart sleep interruptible.
@@ -1044,24 +1096,47 @@ mod tests {
         // derived from the same expression, so they cannot drift apart. Previously SteamCMD got
         // a *relative* `..\Arma_Reforger` that only resolved correctly if the process happened
         // to have the steamcmd folder as its working directory.
-        let install_dir = PathBuf::from(r"C:\Arma Server");
+        // An absolute path with a space, in whatever form is native to the host running this
+        // test (see `is_absolute()` below — `C:\...` isn't absolute by Rust's own reckoning on
+        // a non-Windows host).
+        let install_dir = if cfg!(windows) {
+            PathBuf::from(r"C:\Arma Server")
+        } else {
+            PathBuf::from("/opt/Arma Server")
+        };
 
         for (experimental, expected_subdir) in
-            [(false, "arma_reforger"), (true, r"arma_reforger\experimental")]
+            [(false, vec!["arma_reforger"]), (true, vec!["arma_reforger", "experimental"])]
         {
-            let subdir = if experimental {
-                "arma_reforger\\experimental"
-            } else {
-                "arma_reforger"
-            };
-            let server_working_dir = install_dir.join(subdir);
+            let server_working_dir = server_install_subdir(&install_dir, experimental);
 
-            assert_eq!(server_working_dir, install_dir.join(expected_subdir));
+            let mut expected = install_dir.clone();
+            for part in expected_subdir {
+                expected = expected.join(part);
+            }
+            assert_eq!(server_working_dir, expected);
             assert!(server_working_dir.is_absolute());
             // Passing this as a single argv entry is what keeps the space in "Arma Server"
             // intact; it must never be whitespace-split.
             assert!(server_working_dir.display().to_string().contains(' '));
         }
+    }
+
+    #[test]
+    fn server_install_subdir_joins_as_separate_path_components() {
+        // Regression: this used to be built as a single string literal
+        // `"arma_reforger\\experimental"` handed to one `.join()` call. On Windows `\` is the
+        // path separator so it happened to work, but on Linux it created/looked for a directory
+        // literally named `arma_reforger\experimental` instead of nested directories.
+        let install_dir = PathBuf::from("/srv/longbow");
+        assert_eq!(
+            server_install_subdir(&install_dir, true),
+            install_dir.join("arma_reforger").join("experimental")
+        );
+        assert_eq!(
+            server_install_subdir(&install_dir, false),
+            install_dir.join("arma_reforger")
+        );
     }
 
     #[test]
@@ -1092,6 +1167,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "windows")]
     fn exit_code_hint_recognizes_known_windows_startup_failures() {
         use std::os::windows::process::ExitStatusExt;
 
@@ -1109,24 +1185,27 @@ mod tests {
     fn server_exe_filename_is_platform_specific() {
         assert_eq!(server_exe_filename(&ServerTarget::Windows), "ArmaReforgerServer.exe");
         assert_eq!(server_exe_filename(&ServerTarget::Wsl { distro: None }), "ArmaReforgerServer");
+        assert_eq!(server_exe_filename(&ServerTarget::Linux), "ArmaReforgerServer");
     }
 
     #[test]
-    fn steamcmd_args_force_linux_platform_only_for_wsl_target() {
+    fn steamcmd_args_force_linux_platform_for_any_non_windows_target() {
         let dir = PathBuf::from(r"C:\Arma Server\arma_reforger");
 
         let windows_args = build_steamcmd_args(&ServerTarget::Windows, &dir, "1874900");
         assert!(!windows_args.contains(&"+@sSteamCmdForcePlatformType".to_string()));
         assert_eq!(windows_args[0], "+force_install_dir");
 
-        let wsl_args = build_steamcmd_args(&ServerTarget::Wsl { distro: None }, &dir, "1874900");
-        assert_eq!(wsl_args[0], "+@sSteamCmdForcePlatformType");
-        assert_eq!(wsl_args[1], "linux");
-        // The platform override must come before +app_update, or SteamCMD will already have
-        // resolved the Windows depot by the time it sees it.
-        let app_update_idx = wsl_args.iter().position(|a| a == "+app_update").unwrap();
-        let force_platform_idx = wsl_args.iter().position(|a| a == "+@sSteamCmdForcePlatformType").unwrap();
-        assert!(force_platform_idx < app_update_idx);
+        for target in [ServerTarget::Wsl { distro: None }, ServerTarget::Linux] {
+            let args = build_steamcmd_args(&target, &dir, "1874900");
+            assert_eq!(args[0], "+@sSteamCmdForcePlatformType");
+            assert_eq!(args[1], "linux");
+            // The platform override must come before +app_update, or SteamCMD will already have
+            // resolved the Windows depot by the time it sees it.
+            let app_update_idx = args.iter().position(|a| a == "+app_update").unwrap();
+            let force_platform_idx = args.iter().position(|a| a == "+@sSteamCmdForcePlatformType").unwrap();
+            assert!(force_platform_idx < app_update_idx);
+        }
     }
 
     #[test]
@@ -1219,16 +1298,20 @@ mod tests {
 
     #[test]
     fn mandatory_arguments_survive_as_a_correct_argv_with_spaces_in_paths() {
-        let ctx = ctx_with_mandatory_args(r"C:\Arma Server");
+        // A path with a space, in whatever form is native to the host running this test — the
+        // separator character itself isn't what this test is about (see below).
+        let install_dir = if cfg!(windows) { r"C:\Arma Server" } else { "/opt/Arma Server" };
+        let dir = PathBuf::from(install_dir);
+        let ctx = ctx_with_mandatory_args(install_dir);
         let argv = shell_split(&ProcessService::build_launch_arguments(&ctx));
 
         let pos = |flag: &str| argv.iter().position(|a| a == flag).expect(flag);
 
         // Each path stays a single argv entry despite the space in "Arma Server", and points at
         // the install directory — not at the server's own working directory.
-        assert_eq!(argv[pos("-config") + 1], r"C:\Arma Server\server.json");
-        assert_eq!(argv[pos("-profile") + 1], r"C:\Arma Server\saves");
-        assert_eq!(argv[pos("-addonsDir") + 1], r"C:\Arma Server\addons");
+        assert_eq!(argv[pos("-config") + 1], dir.join("server.json").display().to_string());
+        assert_eq!(argv[pos("-profile") + 1], dir.join("saves").display().to_string());
+        assert_eq!(argv[pos("-addonsDir") + 1], dir.join("addons").display().to_string());
         assert_eq!(argv[pos("-logStats") + 1], "5000");
         assert_eq!(argv[pos("-logLevel") + 1], "normal");
     }
