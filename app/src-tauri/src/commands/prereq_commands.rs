@@ -50,8 +50,17 @@ pub async fn check_prerequisites(
             }
         }
         ServerTarget::Linux => {
+            // Unlike the ldd-based check below, this doesn't need an install directory at all —
+            // it's a pure host-machine check, so it's worth surfacing before the user has even
+            // located/downloaded a server (and before they hit the fail-fast in
+            // `ProcessService::run_steamcmd_then_server` by actually clicking Start).
+            let mut results = vec![
+                prereq_service::check_steamcmd_32bit_runtime(),
+                prereq_service::check_linux_ca_bundle(),
+            ];
+
             let Some(working_dir) = server_working_dir(&state).await else {
-                return Ok(Vec::new());
+                return Ok(results);
             };
             match prereq_service::check_linux_runtime(
                 &working_dir,
@@ -59,10 +68,11 @@ pub async fn check_prerequisites(
             )
             .await
             {
-                Ok(Some(prereq)) => Ok(vec![prereq]),
-                Ok(None) => Ok(Vec::new()),
-                Err(e) => Err(e.to_string()),
+                Ok(Some(prereq)) => results.push(prereq),
+                Ok(None) => {}
+                Err(e) => return Err(e.to_string()),
             }
+            Ok(results)
         }
     }
 }

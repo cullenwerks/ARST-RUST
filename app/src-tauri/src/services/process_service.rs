@@ -484,6 +484,22 @@ impl ProcessService {
             )));
         }
 
+        // Fail fast rather than burning through `MAX_STEAMCMD_ATTEMPTS` retries against a machine
+        // that can never succeed: SteamCMD's Linux bootstrap (a) is a 32-bit binary, so without
+        // 32-bit glibc it dies instantly with an opaque shell-level "cannot execute: required
+        // file not found", and (b) hardcodes a CA bundle path for its trust store, so without a
+        // real file there it fails outbound HTTPS and blames "needs to be online" instead. Both
+        // give no indication of the real, single-file cause.
+        if matches!(ctx.server_target, ServerTarget::Linux) {
+            let prereqs = [
+                crate::services::prereq_service::check_steamcmd_32bit_runtime(),
+                crate::services::prereq_service::check_linux_ca_bundle(),
+            ];
+            if let Some(prereq) = prereqs.iter().find(|p| !p.satisfied) {
+                return Err(ServiceError::Other(format!("{}: {}", prereq.name, prereq.detail)));
+            }
+        }
+
         if ctx.keep_server_updated {
             self.emit(log_line("Longbow will ensure the server is up-to-date."));
 
