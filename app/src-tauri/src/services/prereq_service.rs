@@ -169,6 +169,104 @@ pub async fn check_wsl_runtime(
     }
 }
 
+/// Candidate paths for the 32-bit ELF dynamic linker across common distros (Fedora/RHEL use
+/// `/lib`, Debian/Ubuntu's multiarch layout uses `/lib/i386-linux-gnu`, some others `/lib32` or
+/// `/usr/lib32`).
+const LD_LINUX_32_CANDIDATES: &[&str] = &[
+    "/lib/ld-linux.so.2",
+    "/lib32/ld-linux.so.2",
+    "/usr/lib32/ld-linux.so.2",
+    "/lib/i386-linux-gnu/ld-linux.so.2",
+];
+
+/// Checks for the 32-bit compatibility runtime SteamCMD's official Linux installer needs.
+/// `linux32/steamcmd` — the small bootstrap binary inside the archive Longbow downloads — is a
+/// 32-bit ELF executable even though the game/server depot it goes on to install is 64-bit.
+/// Without 32-bit glibc it fails immediately with an opaque shell-level "cannot execute:
+/// required file not found", which gives no hint that a whole runtime is missing rather than the
+/// file itself (the file is right there — it's the file's own ELF interpreter that's absent).
+pub fn check_steamcmd_32bit_runtime() -> Prerequisite {
+    if LD_LINUX_32_CANDIDATES.iter().any(|p| Path::new(p).exists()) {
+        Prerequisite::satisfied(
+            "steamcmd-32bit",
+            "32-bit runtime libraries (for SteamCMD)",
+            "Present.",
+        )
+    } else {
+        Prerequisite::missing(
+            "steamcmd-32bit",
+            "32-bit runtime libraries (for SteamCMD)",
+            vec!["ld-linux.so.2".to_string()],
+            "SteamCMD's Linux installer is a 32-bit program and needs 32-bit compatibility \
+             libraries even on a 64-bit system. On Fedora/RHEL: `sudo dnf install glibc.i686`. \
+             On Debian/Ubuntu: `sudo dpkg --add-architecture i386 && sudo apt-get update && \
+             sudo apt-get install libc6:i386`. Without this, SteamCMD can never run, no matter \
+             how many times Longbow retries it.",
+            false,
+        )
+    }
+}
+
+/// The single path SteamCMD's own code hardcodes for its trust store — confirmed empirically
+/// (not just inferred from docs): setting the standard OpenSSL `SSL_CERT_FILE`/`SSL_CERT_DIR`
+/// env vars has **no effect** on it at all, but creating a real file/symlink at this exact path
+/// fixes it immediately. Its error output blames the network ("Steamcmd needs to be online to
+/// update") when what's actually missing is this one file, preceded by a much more honest
+/// "unable to load trusted SSL root certificates" line one screen up that's easy to miss.
+const STEAMCMD_CA_BUNDLE_PATH: &str = "/etc/ssl/certs/ca-certificates.crt";
+
+/// Other well-known single-file CA bundle locations, in the order curl and Go's `crypto/x509`
+/// check them — used only to suggest what to symlink [`STEAMCMD_CA_BUNDLE_PATH`] to when it's
+/// missing (observed on a stock Fedora install: none of `ca-certificates.crt` or the classic
+/// `/etc/pki/tls/certs/ca-bundle.crt` exist, only the `update-ca-trust` output below does).
+const CA_BUNDLE_FALLBACKS: &[&str] = &[
+    "/etc/pki/tls/certs/ca-bundle.crt",   // Fedora/RHEL 6
+    "/etc/ssl/ca-bundle.pem",             // openSUSE
+    "/etc/pki/tls/cacert.pem",            // OpenELEC
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // RHEL/Fedora (update-ca-trust)
+    "/etc/ssl/cert.pem",                  // Alpine
+];
+
+/// Checks for the CA bundle file SteamCMD hardcodes, for the Prerequisites panel. Longbow can't
+/// fix this itself — creating it means writing into `/etc/ssl/certs/`, a root-owned system
+/// directory — so this only ever reports manual instructions (`auto_installable: false`), same
+/// as the Windows GUI-subsystem/UCRT checks that also can't be fixed without the user's own
+/// elevated action.
+pub fn check_linux_ca_bundle() -> Prerequisite {
+    if Path::new(STEAMCMD_CA_BUNDLE_PATH).exists() {
+        return Prerequisite::satisfied(
+            "ca-bundle",
+            "CA certificate bundle (for SteamCMD)",
+            "Present.",
+        );
+    }
+
+    let detail = match CA_BUNDLE_FALLBACKS.iter().find(|p| Path::new(p).exists()) {
+        Some(found) => format!(
+            "SteamCMD hardcodes `{STEAMCMD_CA_BUNDLE_PATH}` for its trust store and ignores the \
+             usual `SSL_CERT_FILE`/`SSL_CERT_DIR` overrides — without it, it fails with a \
+             misleading \"needs to be online\" error even though the network is fine. Your \
+             system's actual CA bundle is at `{found}`; link it into place: `sudo ln -s {found} \
+             {STEAMCMD_CA_BUNDLE_PATH}`.",
+        ),
+        None => format!(
+            "SteamCMD hardcodes `{STEAMCMD_CA_BUNDLE_PATH}` for its trust store and ignores the \
+             usual `SSL_CERT_FILE`/`SSL_CERT_DIR` overrides. No system CA bundle could be found \
+             to link into place — reinstall your distribution's CA certificates package (e.g. \
+             `sudo dnf reinstall ca-certificates` on Fedora, `sudo apt-get install --reinstall \
+             ca-certificates` on Debian/Ubuntu), then re-check.",
+        ),
+    };
+
+    Prerequisite::missing(
+        "ca-bundle",
+        "CA certificate bundle (for SteamCMD)",
+        vec![STEAMCMD_CA_BUNDLE_PATH.to_string()],
+        &detail,
+        false,
+    )
+}
+
 /// Asks the dynamic linker directly (no WSL wrapper) which shared libraries the native Linux
 /// server binary needs and can't resolve, via `ldd`. This is the native-Linux counterpart of
 /// [`check_wsl_runtime`] — same idea, but Longbow itself is already the Linux process here, so
@@ -309,6 +407,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = check_linux_runtime(dir.path(), "ArmaReforgerServer").await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn steamcmd_32bit_runtime_check_reports_a_stable_id_and_usable_detail() {
+        // Runs against the real machine, so satisfied/unsatisfied depends on the host — but the
+        // shape must be stable, and the fix instructions must be present regardless of outcome.
+        let result = check_steamcmd_32bit_runtime();
+        assert_eq!(result.id, "steamcmd-32bit");
+        assert!(!result.detail.is_empty());
+        if !result.satisfied {
+            assert!(result.detail.contains("glibc.i686"));
+            assert!(result.detail.contains("libc6:i386"));
+        }
+    }
+
+    #[test]
+    fn ca_bundle_check_reports_a_stable_id_and_usable_detail() {
+        // Runs against the real machine, so found/not-found depends on the host — but the shape
+        // must be stable, and the fix instructions must be present when it's missing.
+        let result = check_linux_ca_bundle();
+        assert_eq!(result.id, "ca-bundle");
+        assert!(!result.detail.is_empty());
+        if !result.satisfied {
+            assert!(result.detail.contains("/etc/ssl/certs/ca-certificates.crt"));
+        }
     }
 
     #[test]
